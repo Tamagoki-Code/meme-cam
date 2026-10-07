@@ -1,7 +1,8 @@
 """
 Meme Cam
 Make the right pose and the matching meme GIF (with sound) plays over your
-webcam feed. Press q or Esc to quit, f to toggle fullscreen.
+webcam feed, positioned above whoever is doing the pose. Works with multiple
+people in frame at once. Press q or Esc to quit, f to toggle fullscreen.
 
 Setup:
     pip install opencv-python mediapipe pillow numpy pyglet
@@ -31,10 +32,17 @@ from PIL import Image, ImageSequence
 
 # ---------------- settings you can tweak ----------------
 CAMERA_INDEX = 0
+TARGET_FPS = 60           # requested without touching resolution (see open_camera)
+MAX_PEOPLE = 4            # most people trackable at once
+PERSON_MATCH_MAX_DIST = 0.3  # how close a hand/face must be to count as the same person
+STICKY_FACE_SEC = 0.4     # keep using a person's last-seen face this long after a frame misses it
+STICKY_HAND_SEC = 0.4     # same, for an individual hand (covering the face can hide it briefly)
+DUPLICATE_HAND_MAX_DIST = 0.08  # two detections this close are treated as the same physical hand
 WINDOW_SEC = 1.0          # how far back to measure hand movement
 MIN_STEP = 0.004          # ignore tiny jitters between frames
 KEEP_SEC = 1.0            # keep a GIF up this long after its trigger stops matching
-GIF_WIDTH_FRACTION = 0.4  # GIF width as a fraction of the camera frame
+GIF_WIDTH_FRACTION = 0.22  # fallback GIF width (as a fraction of frame width) when no face is found
+GIF_TO_FACE_WIDTH_RATIO = 1.3  # GIF width relative to that person's face width
 SHOW_LANDMARKS = True
 SHOW_DEBUG = True
 
@@ -50,7 +58,7 @@ CINEMA_LEVEL_TOL = 0.08   # max allowed height difference between the two wrists
 CINEMA_MIN_TEMPLE_DIST = 0.22  # each wrist must be at least this far from either temple
 
 # salute: one hand raised up near the head/temple and held mostly still
-SALUTE_MAX_Y = 0.35       # wrist must be above this height (0 = top of frame)
+SALUTE_MAX_Y = 0.55       # wrist must be above this height (0 = top of frame)
 SALUTE_MAX_MOTION = 0.15  # that hand's motion score must stay below this (held in place)
 SALUTE_MAX_TEMPLE_DIST = 0.18  # that hand's wrist must stay within this of a temple landmark
 
@@ -58,7 +66,7 @@ SALUTE_MAX_TEMPLE_DIST = 0.18  # that hand's wrist must stay within this of a te
 LEBRON_TEMPLE_MAX_DIST = 0.18
 
 # heart hands: thumbs touching, index fingers touching, forming a heart shape
-HEART_MAX_FINGERTIP_DIST = 0.09
+HEART_MAX_FINGERTIP_DIST = 0.05
 
 # emoji nerd: mouth open and one index finger pointed up (like adjusting glasses)
 NERD_MOUTH_OPEN_RATIO = 0.3  # mouth-gap / eye-distance must be at least this
@@ -95,10 +103,11 @@ def ensure_model():
 HAND_COLORS = {"Left": (60, 60, 255), "Right": (60, 220, 60)}  # BGR: Left=red, Right=green
 
 
-def draw_hand(frame, landmarks, label):
+def draw_hand(frame, points, label):
+    """points: 21 (x, y) tuples in normalized [0, 1] coordinates."""
     h, w = frame.shape[:2]
     color = HAND_COLORS.get(label, (180, 80, 255))
-    pts = [(int(p.x * w), int(p.y * h)) for p in landmarks]
+    pts = [(int(x * w), int(y * h)) for x, y in points]
     for a, b in HAND_CONNECTIONS:
         cv2.line(frame, pts[a], pts[b], color, 2)
     for p in pts:
@@ -106,20 +115,63 @@ def draw_hand(frame, landmarks, label):
     cv2.putText(frame, label, pts[0], cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
-def index_finger_up(lm):
-    """True if the index finger is extended while the other three fingers are curled."""
+class HandSmoother:
+    """Exponential moving average over each hand's 21 landmark points, to stop the
+    overlay (and trigger geometry) from jittering frame to frame. Snaps instead of
+    blending when a hand jumps too far, so fast motion isn't laggy/trailing."""
+
+    def __init__(self, alpha=0.5, max_jump=0.2):
+        self.alpha = alpha
+        self.max_jump = max_jump
+        self.last = {}  # label -> np.array(21, 2)
+
+    def smooth(self, label, points):
+        pts = np.array(points, dtype=np.float32)
+        prev = self.last.get(label)
+        if prev is None or np.linalg.norm(pts[0] - prev[0]) > self.max_jump:
+            smoothed = pts
+        else:
+            smoothed = self.alpha * pts + (1 - self.alpha) * prev
+        self.last[label] = smoothed
+        return [tuple(p) for p in smoothed]
+
+
+def index_finger_up(points):
+    """True if the index finger is extended while the other three fingers are curled.
+    points: 21 (x, y) tuples."""
     def extended(tip_idx, pip_idx):
-        return lm[tip_idx].y < lm[pip_idx].y  # smaller y = higher up on screen
+        return points[tip_idx][1] < points[pip_idx][1]  # smaller y = higher up on screen
     return (extended(8, 6)
             and not extended(12, 10)
             and not extended(16, 14)
             and not extended(20, 18))
 
 
+def build_face_data(fl):
+    """Extracts the landmark points each trigger cares about, plus a face bounding box."""
+    xs = [p.x for p in fl]
+    ys = [p.y for p in fl]
+    return {
+        "nose": (fl[NOSE_TIP_IDX].x, fl[NOSE_TIP_IDX].y),
+        "left_temple": (fl[LEFT_TEMPLE_IDX].x, fl[LEFT_TEMPLE_IDX].y),
+        "right_temple": (fl[RIGHT_TEMPLE_IDX].x, fl[RIGHT_TEMPLE_IDX].y),
+        "upper_lip": (fl[UPPER_LIP_IDX].x, fl[UPPER_LIP_IDX].y),
+        "lower_lip": (fl[LOWER_LIP_IDX].x, fl[LOWER_LIP_IDX].y),
+        "left_eye": (fl[LEFT_EYE_OUTER_IDX].x, fl[LEFT_EYE_OUTER_IDX].y),
+        "right_eye": (fl[RIGHT_EYE_OUTER_IDX].x, fl[RIGHT_EYE_OUTER_IDX].y),
+        "bbox": (min(xs), min(ys), max(xs), max(ys)),
+    }
+
+
+EMPTY_FACE = {"nose": None, "left_temple": None, "right_temple": None,
+              "upper_lip": None, "lower_lip": None, "left_eye": None, "right_eye": None,
+              "bbox": None}
+
+
 def draw_face_points(frame, face):
     h, w = frame.shape[:2]
     for name, pt in face.items():
-        if pt is None:
+        if name == "bbox" or pt is None:
             continue
         cv2.circle(frame, (int(pt[0] * w), int(pt[1] * h)), 4, (0, 255, 255), -1)
         cv2.putText(frame, name, (int(pt[0] * w) + 6, int(pt[1] * h)),
@@ -132,18 +184,10 @@ def load_image_frames(path):
     if getattr(img, "is_animated", False):
         frames, durations = [], []
         for f in ImageSequence.Iterator(img):
-            frames.append(f.convert("RGBA"))
+            frames.append(np.array(f.convert("RGBA")))
             durations.append(max(f.info.get("duration", 100), 40) / 1000)
         return frames, durations
-    return [img.convert("RGBA")], [1.0]
-
-
-def resize_frames(frames, target_w):
-    out = []
-    for f in frames:
-        h = int(f.height * target_w / f.width)
-        out.append(np.array(f.resize((target_w, h), Image.LANCZOS)))
-    return out
+    return [np.array(img.convert("RGBA"))], [1.0]
 
 
 def frame_index(t, durations):
@@ -155,12 +199,19 @@ def frame_index(t, durations):
 
 
 def overlay(frame, rgba, x, y):
+    """Composites rgba onto frame at (x, y), clipping to whatever part is on-screen
+    (the sprite may be larger than the frame, or placed partly off its edges)."""
     h, w = rgba.shape[:2]
     H, W = frame.shape[:2]
-    x, y = max(0, min(x, W - w)), max(0, min(y, H - h))
-    roi = frame[y:y + h, x:x + w]
-    alpha = rgba[:, :, 3:4] / 255.0
-    bgr = rgba[:, :, [2, 1, 0]]
+    fx0, fy0 = max(x, 0), max(y, 0)
+    fx1, fy1 = min(x + w, W), min(y + h, H)
+    if fx0 >= fx1 or fy0 >= fy1:
+        return
+    sx0, sy0 = fx0 - x, fy0 - y
+    sx1, sy1 = sx0 + (fx1 - fx0), sy0 + (fy1 - fy0)
+    roi = frame[fy0:fy1, fx0:fx1]
+    alpha = rgba[sy0:sy1, sx0:sx1, 3:4] / 255.0
+    bgr = rgba[sy0:sy1, sx0:sx1, [2, 1, 0]]
     roi[:] = (alpha * bgr + (1 - alpha) * roi).astype(np.uint8)
 
 
@@ -195,7 +246,7 @@ class MotionTracker:
 ## ---- reusable geometry helpers for writing new triggers ----
 
 def dist(a, b):
-    """Distance between two (x, y) points, or False-y if either is missing."""
+    """Distance between two (x, y) points, or None if either is missing."""
     if a is None or b is None:
         return None
     return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
@@ -232,9 +283,9 @@ def hand_motion(tracker, label):
     return tracker.scores()[label]
 
 
-## ---- meme triggers: each returns True/False from this frame's landmarks ----
+## ---- meme triggers: each returns True/False from one person's landmarks this frame ----
 # wrists: {"Left"/"Right": (x, y)}   fingers: {"Left"/"Right": {"thumb": (x,y), "index": (x,y)}}
-# face: {"nose"/"left_temple"/"right_temple": (x, y) or None}   tracker: MotionTracker
+# face: {"nose"/"left_temple"/"right_temple"/...: (x, y) or None}   tracker: that person's MotionTracker
 
 def scuba_cat_trigger(wrists, tracker, face, fingers):
     paddling = hand_motion(tracker, SCUBA_PADDLE_HAND) >= SCUBA_MOTION_THRESHOLD
@@ -289,7 +340,7 @@ def emoji_nerd_trigger(wrists, tracker, face, fingers):
     return (mouth_gap / eye_dist) >= NERD_MOUTH_OPEN_RATIO
 
 
-# Order matters: the first matching trigger wins each frame.
+# Order matters: the first matching trigger wins each frame, per person.
 MEMES = [
     {"name": "absolute_cinema", "trigger": absolute_cinema_trigger},
     {"name": "lebron_scream", "trigger": lebron_scream_trigger},
@@ -323,14 +374,14 @@ def load_meme(meme):
     else:
         print(f"No sound found at {mp3_path}, running without audio for {meme['name']}.")
     meme.update(
-        frames=frames,
+        frames=frames,          # original-resolution RGBA numpy arrays, one per GIF frame
         durations=durations,
         total=sum(durations),
-        sprites=None,
         player=player,
         playing=False,
         last_trigger=-1e9,
         start=0.0,
+        positions=[],           # where to draw it this frame: list of display_pos (see below)
     )
 
 
@@ -354,20 +405,132 @@ def update_meme(meme, now, active):
     return showing
 
 
-def draw_meme(meme, frame, now):
-    if meme["sprites"] is None:
-        meme["sprites"] = resize_frames(meme["frames"], int(frame.shape[1] * GIF_WIDTH_FRACTION))
+def get_sprite(meme, now, target_w):
     t = (now - meme["start"]) % meme["total"]
-    sprite = meme["sprites"][frame_index(t, meme["durations"])]
+    src = meme["frames"][frame_index(t, meme["durations"])]
+    target_w = max(1, target_w)
+    target_h = max(1, int(src.shape[0] * target_w / src.shape[1]))
+    return cv2.resize(src, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+def display_pos(person):
+    """Where to draw a GIF for this person: above their face if we have one, else None."""
+    bbox = person["face"].get("bbox")
+    if bbox is None:
+        return None
+    x0, y0, x1, y1 = bbox
+    return {"cx": (x0 + x1) / 2, "top": y0, "face_width": x1 - x0}
+
+
+def draw_meme_at(meme, frame, now, pos):
+    H, W = frame.shape[:2]
+    if pos is None:
+        target_w = int(W * GIF_WIDTH_FRACTION)
+        sprite = get_sprite(meme, now, target_w)
+        h, w = sprite.shape[:2]
+        overlay(frame, sprite, W - w - 20, H - h - 20)
+        return
+    target_w = int(min(max(40, pos["face_width"] * W) * GIF_TO_FACE_WIDTH_RATIO, W * 1.2))
+    sprite = get_sprite(meme, now, target_w)
     h, w = sprite.shape[:2]
-    overlay(frame, sprite, frame.shape[1] - w - 20, frame.shape[0] - h - 20)
+    x = int(pos["cx"] * W - w / 2)
+    y = int(pos["top"] * H - h - 10)  # place just above the top of the head
+    overlay(frame, sprite, x, y)
+
+
+def open_camera():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    # FPS only - deliberately not touching resolution, since changing it was what
+    # seemed to be triggering the camera's onboard auto-framing crop.
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+    return cap
+
+
+class PeopleTracker:
+    """
+    Keeps a stable small-integer id per person across frames (by nearest face
+    position), each with its own MotionTracker so one person's hand motion
+    doesn't get mixed up with another's.
+
+    Also keeps a short-lived "sticky" cache of each person's last-seen face and
+    hands. Detection is noisy when a hand partially covers the face (e.g. the
+    scuba pose) - without this, a single dropped frame would wipe out the hand
+    or face and break a trigger that's genuinely still being held.
+    """
+
+    def __init__(self, max_people):
+        self.max_people = max_people
+        self.prev_centers = [None] * max_people
+        self.prev_center_ts = [0.0] * max_people
+        self.face_cache = [None] * max_people
+        self.wrist_cache = [{} for _ in range(max_people)]  # label -> (wrist, fingers, ts)
+        self.trackers = [MotionTracker() for _ in range(max_people)]
+
+    def assign_faces(self, raw_faces, now):
+        """raw_faces: list of face center (x, y) points. Returns {slot_id: raw_face_index}."""
+        assigned = {}
+        used_faces = set()
+        for slot_id, prev_center in enumerate(self.prev_centers):
+            if prev_center is None:
+                continue
+            best_idx, best_dist = None, PERSON_MATCH_MAX_DIST
+            for idx, center in enumerate(raw_faces):
+                if idx in used_faces:
+                    continue
+                d = dist(prev_center, center)
+                if d is not None and d <= best_dist:
+                    best_idx, best_dist = idx, d
+            if best_idx is not None:
+                assigned[slot_id] = best_idx
+                used_faces.add(best_idx)
+        free_slots = [s for s in range(self.max_people) if s not in assigned]
+        for idx, center in enumerate(raw_faces):
+            if idx in used_faces or not free_slots:
+                continue
+            slot_id = free_slots.pop(0)
+            assigned[slot_id] = idx
+            used_faces.add(idx)
+        for slot_id in range(self.max_people):
+            if slot_id in assigned:
+                self.prev_centers[slot_id] = raw_faces[assigned[slot_id]]
+                self.prev_center_ts[slot_id] = now
+            elif (self.prev_centers[slot_id] is not None
+                    and now - self.prev_center_ts[slot_id] > STICKY_FACE_SEC):
+                self.prev_centers[slot_id] = None
+                self.face_cache[slot_id] = None
+        return assigned
+
+    def recent_wrist(self, slot_id, label, now):
+        cached = self.wrist_cache[slot_id].get(label)
+        if cached is not None and now - cached[2] <= STICKY_HAND_SEC:
+            return cached[0], cached[1]
+        return None, None
+
+    def remember_wrist(self, slot_id, label, wrist, fingers, now):
+        self.wrist_cache[slot_id][label] = (wrist, fingers, now)
+
+    def nearest_slot(self, people, point):
+        best_slot, best_dist = None, None
+        for slot_id, person in people.items():
+            center = person["face"].get("nose") or self._bbox_center(person["face"].get("bbox"))
+            d = dist(point, center)
+            if d is not None and (best_dist is None or d < best_dist):
+                best_slot, best_dist = slot_id, d
+        return best_slot
+
+    @staticmethod
+    def _bbox_center(bbox):
+        if bbox is None:
+            return None
+        x0, y0, x1, y1 = bbox
+        return ((x0 + x1) / 2, (y0 + y1) / 2)
 
 
 def main():
     for meme in MEMES:
         load_meme(meme)
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = open_camera()
     if not cap.isOpened():
         sys.exit("Could not open the camera. Try a different CAMERA_INDEX.")
 
@@ -375,22 +538,23 @@ def main():
     hand_options = vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=vision.RunningMode.VIDEO,
-        num_hands=2,
-        min_hand_detection_confidence=0.6,
-        min_tracking_confidence=0.5,
+        num_hands=MAX_PEOPLE * 2,
+        min_hand_detection_confidence=0.4,
+        min_tracking_confidence=0.3,
     )
     face_options = vision.FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
         running_mode=vision.RunningMode.VIDEO,
-        num_faces=1,
-        min_face_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+        num_faces=MAX_PEOPLE,
+        min_face_detection_confidence=0.4,
+        min_tracking_confidence=0.4,
     )
-    tracker = MotionTracker()
+    people_tracker = PeopleTracker(MAX_PEOPLE)
+    hand_smoother = HandSmoother()
     t0, last_ts = time.time(), -1
 
     window_name = "Meme Cam"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
     fullscreen = False
 
     with vision.HandLandmarker.create_from_options(hand_options) as hands, \
@@ -407,51 +571,113 @@ def main():
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            res = hands.detect_for_video(image, ts)
-            wrists = {}
-            fingers = {}
-            for lm, hd in zip(res.hand_landmarks, res.handedness):
+            # --- detect ---
+            hand_res = hands.detect_for_video(image, ts)
+            candidates = []
+            for lm, hd in zip(hand_res.hand_landmarks, hand_res.handedness):
                 # frame is mirrored for display, so flip the reported handedness back
                 label = "Right" if hd[0].category_name == "Left" else "Left"
-                wrists[label] = (lm[0].x, lm[0].y)
-                fingers[label] = {
-                    "thumb": (lm[4].x, lm[4].y),
-                    "index": (lm[8].x, lm[8].y),
-                    "index_up": index_finger_up(lm),
-                }
-                if SHOW_LANDMARKS:
-                    draw_hand(frame, lm, label)
+                candidates.append({"lm": lm, "label": label, "score": hd[0].score,
+                                    "wrist_raw": (lm[0].x, lm[0].y)})
+
+            # the detector occasionally reports the same physical hand twice (often
+            # misclassifying it as both Left and Right) - drop the lower-confidence copy
+            candidates.sort(key=lambda c: c["score"], reverse=True)
+            kept = []
+            for c in candidates:
+                if not any(dist(c["wrist_raw"], k["wrist_raw"]) <= DUPLICATE_HAND_MAX_DIST
+                           for k in kept):
+                    kept.append(c)
+
+            raw_hands = []
+            for c in kept:
+                lm, label = c["lm"], c["label"]
+                points = hand_smoother.smooth(label, [(p.x, p.y) for p in lm])
+                raw_hands.append({
+                    "label": label,
+                    "wrist": points[0],
+                    "wrist_raw": (lm[0].x, lm[0].y),  # unsmoothed, for measuring real motion
+                    "fingers": {
+                        "thumb": points[4],
+                        "index": points[8],
+                        "index_up": index_finger_up(points),
+                    },
+                    "points": points,
+                })
 
             face_res = face_landmarker.detect_for_video(image, ts)
-            face = {"nose": None, "left_temple": None, "right_temple": None,
-                    "upper_lip": None, "lower_lip": None, "left_eye": None, "right_eye": None}
-            if face_res.face_landmarks:
-                fl = face_res.face_landmarks[0]
-                face["nose"] = (fl[NOSE_TIP_IDX].x, fl[NOSE_TIP_IDX].y)
-                face["left_temple"] = (fl[LEFT_TEMPLE_IDX].x, fl[LEFT_TEMPLE_IDX].y)
-                face["right_temple"] = (fl[RIGHT_TEMPLE_IDX].x, fl[RIGHT_TEMPLE_IDX].y)
-                face["upper_lip"] = (fl[UPPER_LIP_IDX].x, fl[UPPER_LIP_IDX].y)
-                face["lower_lip"] = (fl[LOWER_LIP_IDX].x, fl[LOWER_LIP_IDX].y)
-                face["left_eye"] = (fl[LEFT_EYE_OUTER_IDX].x, fl[LEFT_EYE_OUTER_IDX].y)
-                face["right_eye"] = (fl[RIGHT_EYE_OUTER_IDX].x, fl[RIGHT_EYE_OUTER_IDX].y)
+            raw_faces = [build_face_data(fl) for fl in face_res.face_landmarks]
+            raw_face_centers = [f["nose"] for f in raw_faces]
+
+            # --- group detections into people, keeping ids stable across frames ---
+            assigned = people_tracker.assign_faces(raw_face_centers, now)
+            people = {}
+            for slot_id, face_idx in assigned.items():
+                people_tracker.face_cache[slot_id] = raw_faces[face_idx]
+                people[slot_id] = {"face": raw_faces[face_idx], "wrists": {}, "fingers": {}}
+            for slot_id in range(MAX_PEOPLE):
+                # a face briefly lost to occlusion (e.g. a hand covering it) still counts
+                # as present for a moment, using its last-known landmarks
+                if (slot_id not in people and people_tracker.prev_centers[slot_id] is not None
+                        and people_tracker.face_cache[slot_id] is not None):
+                    people[slot_id] = {"face": people_tracker.face_cache[slot_id],
+                                        "wrists": {}, "fingers": {}, "wrists_raw": {}}
+            if not people:
+                # nobody's face was detected; still let hand-only poses work for one person
+                people[0] = {"face": dict(EMPTY_FACE), "wrists": {}, "fingers": {}, "wrists_raw": {}}
+            for person in people.values():
+                person.setdefault("wrists_raw", {})
+
+            for raw_hand in raw_hands:
+                slot_id = people_tracker.nearest_slot(people, raw_hand["wrist"])
+                if slot_id is None:
+                    slot_id = next(iter(people))
+                people[slot_id]["wrists"][raw_hand["label"]] = raw_hand["wrist"]
+                people[slot_id]["fingers"][raw_hand["label"]] = raw_hand["fingers"]
+                people[slot_id]["wrists_raw"][raw_hand["label"]] = raw_hand["wrist_raw"]
+                people_tracker.remember_wrist(
+                    slot_id, raw_hand["label"], raw_hand["wrist"], raw_hand["fingers"], now)
                 if SHOW_LANDMARKS:
-                    draw_face_points(frame, face)
+                    draw_hand(frame, raw_hand["points"], raw_hand["label"])
 
-            tracker.update(now, wrists)
+            # a hand briefly lost (e.g. occluded while covering the face) stays "present"
+            # for a moment at its last-known spot, instead of instantly dropping the pose
+            for slot_id, person in people.items():
+                for label in ("Left", "Right"):
+                    if label in person["wrists"]:
+                        continue
+                    wrist, fingers = people_tracker.recent_wrist(slot_id, label, now)
+                    if wrist is not None:
+                        person["wrists"][label] = wrist
+                        person["fingers"][label] = fingers
 
-            matched = None
+            if SHOW_LANDMARKS:
+                for person in people.values():
+                    if person["face"].get("nose") is not None:
+                        draw_face_points(frame, person["face"])
+
+            # --- per person, find the first matching meme this frame ---
+            meme_positions = {meme["name"]: [] for meme in MEMES}
+            matches_debug = []
+            for slot_id, person in people.items():
+                tracker = people_tracker.trackers[slot_id]
+                tracker.update(now, person["wrists_raw"])
+                for meme in MEMES:
+                    if meme["trigger"](person["wrists"], tracker, person["face"], person["fingers"]):
+                        meme_positions[meme["name"]].append(display_pos(person))
+                        matches_debug.append(meme["name"])
+                        break
+
+            # --- update + draw each meme that's currently showing ---
             for meme in MEMES:
-                if matched is None and meme["trigger"](wrists, tracker, face, fingers):
-                    matched = meme["name"]
-
-            active_meme = None
-            for meme in MEMES:
-                showing = update_meme(meme, now, active=(meme["name"] == matched))
+                positions = meme_positions[meme["name"]]
+                active = len(positions) > 0
+                showing = update_meme(meme, now, active)
+                if active:
+                    meme["positions"] = positions
                 if showing:
-                    active_meme = meme
-
-            if active_meme is not None:
-                draw_meme(active_meme, frame, now)
+                    for pos in meme["positions"]:
+                        draw_meme_at(meme, frame, now, pos)
 
             for meme in MEMES:
                 if meme["player"] is not None:
@@ -460,10 +686,8 @@ def main():
                     break
 
             if SHOW_DEBUG:
-                s = tracker.scores()
                 cv2.putText(frame,
-                            f"match: {matched or '-'}  "
-                            f"L {s['Left']:.2f} R {s['Right']:.2f}",
+                            f"people: {len(people)}  match: {', '.join(matches_debug) or '-'}",
                             (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
             cv2.imshow(window_name, frame)
