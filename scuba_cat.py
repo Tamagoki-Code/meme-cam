@@ -9,7 +9,7 @@ Setup:
     python scuba_cat.py
 
 To add a new meme:
-    1. Drop gifs/<name>.<gif|png|jpg|...> and mp3s/<name>.mp3 (mp3 optional).
+    1. Drop gifs/<name>.<gif|png|jpg|...> and mp3s/<name>.<mp3|wav> (sound optional).
     2. Write a trigger(wrists, tracker, face, fingers) -> bool function using
        the near() / near_any() / hands_raised_and_level() / hand_motion()
        helpers above the trigger functions (see the existing ones for examples).
@@ -71,6 +71,24 @@ HEART_MAX_FINGERTIP_DIST = 0.05
 # emoji nerd: mouth open and one index finger pointed up (like adjusting glasses)
 NERD_MOUTH_OPEN_RATIO = 0.3  # mouth-gap / eye-distance must be at least this
 
+# thinking monkey: an index fingertip resting on the chin or either cheek
+THINKING_MAX_DIST = 0.09
+
+# shh / quiet: an index fingertip resting on the lips
+SHH_MAX_DIST = 0.07
+
+# surprised pikachu: mouth dropped wide open and both eyebrows raised
+PIKACHU_MOUTH_OPEN_RATIO = 0.5
+PIKACHU_BROW_RAISE_RATIO = 0.42
+
+# stonks: thumb tip above its base knuckle, with the other four fingers curled
+THUMB_VERTICAL_MARGIN = 0.03
+
+# mewing: an index fingertip sliding along the jawline (chin to jaw), not just resting there
+MEWING_MAX_DIST = 0.09
+MEWING_MIN_MOTION = 0.12    # that hand's motion score must clear this (distinguishes from
+                            # thinking_monkey, which wants the finger held still)
+
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/1/hand_landmarker.task")
@@ -89,6 +107,15 @@ UPPER_LIP_IDX = 13
 LOWER_LIP_IDX = 14
 LEFT_EYE_OUTER_IDX = 263
 RIGHT_EYE_OUTER_IDX = 33
+CHIN_IDX = 152
+LEFT_CHEEK_IDX = 280
+RIGHT_CHEEK_IDX = 50
+LEFT_JAW_IDX = 365
+RIGHT_JAW_IDX = 136
+LEFT_EYEBROW_IDX = 334
+RIGHT_EYEBROW_IDX = 105
+LEFT_EYE_TOP_IDX = 386
+RIGHT_EYE_TOP_IDX = 159
 
 
 def ensure_model():
@@ -136,15 +163,31 @@ class HandSmoother:
         return [tuple(p) for p in smoothed]
 
 
-def index_finger_up(points):
-    """True if the index finger is extended while the other three fingers are curled.
+def finger_extended(points, tip_idx, pip_idx):
+    """True if the joint at tip_idx is above (smaller y than) the joint at pip_idx.
     points: 21 (x, y) tuples."""
-    def extended(tip_idx, pip_idx):
-        return points[tip_idx][1] < points[pip_idx][1]  # smaller y = higher up on screen
-    return (extended(8, 6)
-            and not extended(12, 10)
-            and not extended(16, 14)
-            and not extended(20, 18))
+    return points[tip_idx][1] < points[pip_idx][1]
+
+
+def index_finger_up(points):
+    """True if the index finger is extended while the other three fingers are curled."""
+    return (finger_extended(points, 8, 6)
+            and not finger_extended(points, 12, 10)
+            and not finger_extended(points, 16, 14)
+            and not finger_extended(points, 20, 18))
+
+
+def _other_fingers_curled(points):
+    return (not finger_extended(points, 8, 6)
+            and not finger_extended(points, 12, 10)
+            and not finger_extended(points, 16, 14)
+            and not finger_extended(points, 20, 18))
+
+
+def thumb_points_up(points):
+    """True if the thumb sticks up above its base knuckle while the other fingers curl
+    into a fist (the "stonks"/thumbs-up shape)."""
+    return _other_fingers_curled(points) and points[4][1] < points[2][1] - THUMB_VERTICAL_MARGIN
 
 
 def build_face_data(fl):
@@ -159,12 +202,38 @@ def build_face_data(fl):
         "lower_lip": (fl[LOWER_LIP_IDX].x, fl[LOWER_LIP_IDX].y),
         "left_eye": (fl[LEFT_EYE_OUTER_IDX].x, fl[LEFT_EYE_OUTER_IDX].y),
         "right_eye": (fl[RIGHT_EYE_OUTER_IDX].x, fl[RIGHT_EYE_OUTER_IDX].y),
+        "chin": (fl[CHIN_IDX].x, fl[CHIN_IDX].y),
+        "left_cheek": (fl[LEFT_CHEEK_IDX].x, fl[LEFT_CHEEK_IDX].y),
+        "right_cheek": (fl[RIGHT_CHEEK_IDX].x, fl[RIGHT_CHEEK_IDX].y),
+        "left_jaw": (fl[LEFT_JAW_IDX].x, fl[LEFT_JAW_IDX].y),
+        "right_jaw": (fl[RIGHT_JAW_IDX].x, fl[RIGHT_JAW_IDX].y),
+        "left_eyebrow": (fl[LEFT_EYEBROW_IDX].x, fl[LEFT_EYEBROW_IDX].y),
+        "right_eyebrow": (fl[RIGHT_EYEBROW_IDX].x, fl[RIGHT_EYEBROW_IDX].y),
+        "left_eye_top": (fl[LEFT_EYE_TOP_IDX].x, fl[LEFT_EYE_TOP_IDX].y),
+        "right_eye_top": (fl[RIGHT_EYE_TOP_IDX].x, fl[RIGHT_EYE_TOP_IDX].y),
         "bbox": (min(xs), min(ys), max(xs), max(ys)),
     }
 
 
+def eyebrow_raise_ratios(face):
+    """(left, right) eyebrow-to-eye gaps, each normalized by inter-eye distance so the
+    measure is scale-invariant. Either side is None if the face isn't detected."""
+    eye_dist = dist(face.get("left_eye"), face.get("right_eye"))
+    if not eye_dist:
+        return None, None
+    left = dist(face.get("left_eyebrow"), face.get("left_eye_top"))
+    right = dist(face.get("right_eyebrow"), face.get("right_eye_top"))
+    if left is None or right is None:
+        return None, None
+    return left / eye_dist, right / eye_dist
+
+
 EMPTY_FACE = {"nose": None, "left_temple": None, "right_temple": None,
               "upper_lip": None, "lower_lip": None, "left_eye": None, "right_eye": None,
+              "chin": None, "left_cheek": None, "right_cheek": None,
+              "left_jaw": None, "right_jaw": None,
+              "left_eyebrow": None, "right_eyebrow": None,
+              "left_eye_top": None, "right_eye_top": None,
               "bbox": None}
 
 
@@ -340,12 +409,64 @@ def emoji_nerd_trigger(wrists, tracker, face, fingers):
     return (mouth_gap / eye_dist) >= NERD_MOUTH_OPEN_RATIO
 
 
-# Order matters: the first matching trigger wins each frame, per person.
+def surprised_pikachu_trigger(wrists, tracker, face, fingers):
+    mouth_gap = dist(face.get("upper_lip"), face.get("lower_lip"))
+    eye_dist = dist(face.get("left_eye"), face.get("right_eye"))
+    if mouth_gap is None or not eye_dist or mouth_gap / eye_dist < PIKACHU_MOUTH_OPEN_RATIO:
+        return False
+    left_ratio, right_ratio = eyebrow_raise_ratios(face)
+    if left_ratio is None:
+        return False
+    return left_ratio >= PIKACHU_BROW_RAISE_RATIO and right_ratio >= PIKACHU_BROW_RAISE_RATIO
+
+
+def shh_trigger(wrists, tracker, face, fingers):
+    upper, lower = face.get("upper_lip"), face.get("lower_lip")
+    if upper is None or lower is None:
+        return False
+    mouth = ((upper[0] + lower[0]) / 2, (upper[1] + lower[1]) / 2)
+    return any(near(f.get("index"), mouth, SHH_MAX_DIST) for f in fingers.values())
+
+
+def mewing_trigger(wrists, tracker, face, fingers):
+    """An index fingertip sliding along the jaw (chin to jaw hinge), not just resting there -
+    the motion requirement is what tells this apart from thinking_monkey."""
+    targets = [p for p in (face.get("chin"), face.get("left_jaw"), face.get("right_jaw"))
+               if p is not None]
+    if not targets:
+        return False
+    for label, f in fingers.items():
+        if (near_any(f.get("index"), targets, MEWING_MAX_DIST)
+                and hand_motion(tracker, label) >= MEWING_MIN_MOTION):
+            return True
+    return False
+
+
+def thinking_monkey_trigger(wrists, tracker, face, fingers):
+    targets = [p for p in (face.get("chin"), face.get("left_cheek"), face.get("right_cheek"))
+               if p is not None]
+    if not targets:
+        return False
+    return any(near_any(f.get("index"), targets, THINKING_MAX_DIST) for f in fingers.values())
+
+
+def stonks_trigger(wrists, tracker, face, fingers):
+    return any(f.get("thumb_up") for f in fingers.values())
+
+
+# Order matters: the first matching trigger wins each frame, per person, so more specific /
+# multi-condition poses go first (e.g. mewing's motion requirement before thinking_monkey's
+# plain "finger resting near the jaw/chin" check, since the two zones overlap).
 MEMES = [
     {"name": "absolute_cinema", "trigger": absolute_cinema_trigger},
     {"name": "lebron_scream", "trigger": lebron_scream_trigger},
     {"name": "heart_hands", "trigger": heart_hands_trigger},
+    {"name": "surprised_pikachu", "trigger": surprised_pikachu_trigger},
     {"name": "emoji_nerd", "trigger": emoji_nerd_trigger},
+    {"name": "shh_quiet", "trigger": shh_trigger},
+    {"name": "mewing", "trigger": mewing_trigger},
+    {"name": "thinking_monkey", "trigger": thinking_monkey_trigger},
+    {"name": "stonks", "trigger": stonks_trigger},
     {"name": "salute", "trigger": salute_trigger},
     {"name": "scuba_cat", "trigger": scuba_cat_trigger},
 ]
@@ -359,20 +480,28 @@ def find_image_path(meme_name):
     return os.path.join("gifs", f"{meme_name}.gif")  # default, for the error message
 
 
+def find_audio_path(meme_name):
+    for ext in (".mp3", ".wav"):
+        path = os.path.join("mp3s", f"{meme_name}{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def load_meme(meme):
     gif_path = find_image_path(meme["name"])
-    mp3_path = os.path.join("mp3s", f"{meme['name']}.mp3")
     try:
         frames, durations = load_image_frames(gif_path)
     except FileNotFoundError:
         sys.exit(f"Could not find an image for {meme['name']} in gifs/.")
     player = None
-    if os.path.exists(mp3_path):
+    audio_path = find_audio_path(meme["name"])
+    if audio_path:
         player = pyglet.media.Player()
-        player.queue(pyglet.media.load(mp3_path, streaming=False))
+        player.queue(pyglet.media.load(audio_path, streaming=False))
         player.loop = True
     else:
-        print(f"No sound found at {mp3_path}, running without audio for {meme['name']}.")
+        print(f"No sound found in mp3s/ for {meme['name']}, running without audio for it.")
     meme.update(
         frames=frames,          # original-resolution RGBA numpy arrays, one per GIF frame
         durations=durations,
@@ -601,6 +730,7 @@ def main():
                         "thumb": points[4],
                         "index": points[8],
                         "index_up": index_finger_up(points),
+                        "thumb_up": thumb_points_up(points),
                     },
                     "points": points,
                 })
